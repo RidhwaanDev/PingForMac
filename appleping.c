@@ -120,9 +120,6 @@ int phdr_len = 0;
 int send_len;
 char *boundif;
 unsigned int ifscope;
-#if defined(IP_FORCE_OUT_IFP) && TARGET_OS_EMBEDDED
-char boundifname[IFNAMSIZ];
-#endif /* IP_FORCE_OUT_IFP */
 int nocell;
 int how_traffic_class = 0;
 int traffic_class = SO_TC_CTL;	/* use control class, by default */
@@ -152,17 +149,11 @@ double tsum = 0.0;		/* sum of all times, for doing average */
 double tsumsq = 0.0;		/* sum of all times squared, for std. dev. */
 
 volatile sig_atomic_t finish_up;  /* nonzero if we've been told to finish up */
-volatile sig_atomic_t siginfo_p;
 
-static void fill(char *, char *);
 static u_short in_cksum(u_short *, int);
-static void check_status(void);
 static void finish(void) __dead2;
 static void pinger(void);
 static void pr_pack(char *, int, struct sockaddr_in *, struct timeval *, int);
-static void pr_retip(struct ip *);
-static void status(int);
-static void stopit(int);
 static void tvsub(struct timeval *, const struct timeval *);
 
 int main(int argc, char *const *argv)
@@ -186,14 +177,8 @@ int main(int argc, char *const *argv)
 	char ctrl[CMSG_SPACE(sizeof(struct timeval)) + CMSG_SPACE(sizeof(int))];
 	char hnamebuf[MAXHOSTNAMELEN], snamebuf[MAXHOSTNAMELEN];
 	unsigned char loop, mttl;
-
 	payload = source = NULL;
 
-	/*in
-	 * Do the stuff that we need root priv's for *first*, and
-	 * then drop our setuid bit.  Save error reporting for
-	 * after arg parsing.
-	 */
 	if (getuid())
 		s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
 	else
@@ -208,45 +193,12 @@ int main(int argc, char *const *argv)
 
 	outpack = outpackhdr + sizeof(struct ip);
 
-	if (boundif != NULL && (ifscope = if_nametoindex(boundif)) == 0)
-		errx(1, "bad interface name");
-
 	target = argv[optind];
 
 	icmp_len = sizeof(struct ip) + ICMP_MINLEN + phdr_len;
-	if (options & F_RROUTE)
-		icmp_len += MAX_IPOPTLEN;
 	maxpayload = IP_MAXPACKET - icmp_len;
-	if (datalen > maxpayload)
-		errx(EX_USAGE, "packet size too large: %d > %d", datalen,
-		    maxpayload);
 	send_len = icmp_len + datalen;
 	datap = &outpack[ICMP_MINLEN + phdr_len + TIMEVAL_LEN];
-	if (source) {
-		bzero((char *)&sock_in, sizeof(sock_in));
-		sock_in.sin_family = AF_INET;
-		if (inet_aton(source, &sock_in.sin_addr) != 0) {
-			shostname = source;
-		} else {
-			hp = gethostbyname2(source, AF_INET);
-			if (!hp)
-				errx(EX_NOHOST, "cannot resolve %s: %s",
-				    source, hstrerror(h_errno));
-
-			sock_in.sin_len = sizeof sock_in;
-			if ((unsigned)hp->h_length > sizeof(sock_in.sin_addr) ||
-			    hp->h_length < 0)
-				errx(1, "gethostbyname2: illegal address");
-			memcpy(&sock_in.sin_addr, hp->h_addr_list[0],
-			    sizeof(sock_in.sin_addr));
-			(void)strncpy(snamebuf, hp->h_name,
-			    sizeof(snamebuf) - 1);
-			snamebuf[sizeof(snamebuf) - 1] = '\0';
-			shostname = snamebuf;
-		}
-		if (bind(s, (struct sockaddr *)&sock_in, sizeof sock_in) == -1)
-			err(1, "bind");
-	}
 
 	bzero(&whereto, sizeof(whereto));
 	to = &whereto;
@@ -259,119 +211,10 @@ int main(int argc, char *const *argv)
 		if (!hp)
 			errx(EX_NOHOST, "cannot resolve %s: %s",
 			    target, hstrerror(h_errno));
-
-		if ((unsigned)hp->h_length > sizeof(to->sin_addr))
-			errx(1, "gethostbyname2 returned an illegal address");
 		memcpy(&to->sin_addr, hp->h_addr_list[0], sizeof to->sin_addr);
 		(void)strncpy(hnamebuf, hp->h_name, sizeof(hnamebuf) - 1);
 		hnamebuf[sizeof(hnamebuf) - 1] = '\0';
 		hostname = hnamebuf;
-	}
-
-	do {
-		struct ifaddrs *ifa_list, *ifa;
-		
-		if (IN_MULTICAST(ntohl(whereto.sin_addr.s_addr)) || whereto.sin_addr.s_addr == INADDR_BROADCAST) {
-			no_dup = 1;
-			break;
-		}
-		
-		if (getifaddrs(&ifa_list) == -1)
-			break;
-		for (ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
-			if (ifa->ifa_addr->sa_family != AF_INET)
-				continue;
-			if ((ifa->ifa_flags & IFF_BROADCAST) == 0 || ifa->ifa_broadaddr == NULL)
-				continue;
-			if (whereto.sin_addr.s_addr != ((struct sockaddr_in*)ifa->ifa_broadaddr)->sin_addr.s_addr)
-				continue;
-			no_dup = 1;
-			break;
-		}
-		
-		freeifaddrs(ifa_list);
-	} while (0);
-	
-if (datalen >= TIMEVAL_LEN)	/* can we time transfer */
-		timing = 1;
-
-	if (!(options & F_PINGFILLED))
-		for (i = TIMEVAL_LEN; i < datalen; ++i)
-			*datap++ = i;
-
-	ident = getpid() & 0xFFFF;
-
-	if (s < 0) {
-		errno = sockerrno;
-		err(EX_OSERR, "socket");
-	}
-	hold = 1;
-	(void) setsockopt(s, SOL_SOCKET, SO_RECV_ANYIF, (char *)&hold,
-	    sizeof(hold));
-	if (ifscope != 0) {
-		if (setsockopt(s, IPPROTO_IP, IP_BOUND_IF,
-		    (char *)&ifscope, sizeof (ifscope)) != 0)
-			err(EX_OSERR, "setsockopt(IP_BOUND_IF)");
-	}
-	if (nocell) {
-		if (setsockopt(s, IPPROTO_IP, IP_NO_IFT_CELLULAR,
-		    (char *)&nocell, sizeof (nocell)) != 0)
-			err(EX_OSERR, "setsockopt(IP_NO_IFT_CELLULAR)");
-	}
-	if (sweepmax) {
-		if (sweepmin >= sweepmax)
-			errx(EX_USAGE, "Maximum packet size must be greater than the minimum packet size");
-
-		if (datalen != DEFDATALEN)
-			errx(EX_USAGE, "Packet size and ping sweep are mutually exclusive");
-
-		if (npackets > 0) {
-			snpackets = npackets;
-			npackets = 0;
-		} else
-			snpackets = 1;
-		datalen = sweepmin;
-		send_len = icmp_len + sweepmin;
-	}
-	if (options & F_SWEEP && !sweepmax) 
-		errx(EX_USAGE, "Maximum sweep size must be specified");
-
-	/*
-	 * When pinging the broadcast address, you can get a lot of answers.
-	 * Doing something so evil is useful if you are trying to stress the
-	 * ethernet, or just want to fill the arp cache to get some stuff for
-	 * /etc/ethers.  But beware: RFC 1122 allows hosts to ignore broadcast
-	 * or multicast pings if they wish.
-	 */
-
-	/*
-	 * XXX receive buffer needs undetermined space for mbuf overhead
-	 * as well.
-	 */
-	hold = IP_MAXPACKET + 128;
-	(void)setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char *)&hold,
-	    sizeof(hold));
-	if (uid == 0)
-		(void)setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char *)&hold,
-		    sizeof(hold));
-
-	if (to->sin_family == AF_INET) {
-		(void)printf("PING %s (%s)", hostname,
-		    inet_ntoa(to->sin_addr));
-		if (source)
-			(void)printf(" from %s", shostname);
-		if (sweepmax)
-			(void)printf(": (%d ... %d) data bytes\n",
-			    sweepmin, sweepmax);
-		else 
-			(void)printf(": %d data bytes\n", datalen);
-		
-	} else {
-		if (sweepmax)
-			(void)printf("PING %s: (%d ... %d) data bytes\n",
-			    hostname, sweepmin, sweepmax);
-		else
-			(void)printf("PING %s: %d data bytes\n", hostname, datalen);
 	}
 
 	bzero(&msg, sizeof(msg));
@@ -389,7 +232,7 @@ if (datalen >= TIMEVAL_LEN)	/* can we time transfer */
 		while (preload--)	/* fire off them quickies */
 			pinger();
 	}
-	(void)gettimeofday(&last, NULL);
+	gettimeofday(&last, NULL);
 
 	if (options & F_FLOOD) {
 		intvl.tv_sec = 0;
@@ -410,7 +253,7 @@ if (datalen >= TIMEVAL_LEN)	/* can we time transfer */
 			errx(EX_OSERR, "descriptor too large");
 		FD_ZERO(&rfds);
 		FD_SET(s, &rfds);
-		(void)gettimeofday(&now, NULL);
+		gettimeofday(&now, NULL);
 		timeout.tv_sec = last.tv_sec + intvl.tv_sec - now.tv_sec;
 		timeout.tv_usec = last.tv_usec + intvl.tv_usec - now.tv_usec;
 		while (timeout.tv_usec < 0) {
@@ -483,7 +326,7 @@ if (datalen >= TIMEVAL_LEN)	/* can we time transfer */
 					intvl.tv_usec = waittime % 1000 * 1000;
 				}
 			}
-			(void)gettimeofday(&last, NULL);
+			gettimeofday(&last, NULL);
 			if (ntransmitted - nreceived - 1 > nmissedmax) {
 				nmissedmax = ntransmitted - nreceived - 1;
 				if (options & F_MISSED)
@@ -493,7 +336,6 @@ if (datalen >= TIMEVAL_LEN)	/* can we time transfer */
 			}
 		}
 	}
-	finish();
 	exit(0);	/* Make the compiler happy */
 }
 
@@ -525,20 +367,6 @@ pinger(void)
 	icp->icmp_id = ident;			/* ID */
 
 	CLR(ntransmitted % mx_dup_ck);
-
-	if ((options & F_TIME) || timing) {
-		(void)gettimeofday(&now, NULL);
-
-		tv32.tv32_sec = htonl(now.tv_sec);
-		tv32.tv32_usec = htonl(now.tv_usec);
-		if (options & F_TIME)
-			icp->icmp_otime = htonl((now.tv_sec % (24*60*60))
-				* 1000 + now.tv_usec / 1000);
-		if (timing)
-			bcopy((void *)&tv32,
-			    (void *)&outpack[ICMP_MINLEN + phdr_len],
-			    sizeof(tv32));
-	}
 
 	cc = ICMP_MINLEN + phdr_len + datalen;
 
@@ -808,14 +636,4 @@ tvsub(struct timeval *out, const struct timeval *in)
 	out->tv_sec -= in->tv_sec;
 }
 
-
-/*
- * finish --
- *	Print out statistics, and give up.
- */
-static void
-finish(void)
-{
-
-}
 
