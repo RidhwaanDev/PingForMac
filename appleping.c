@@ -144,10 +144,29 @@ int main(int argc, char *const *argv)
 		strncpy(hnamebuf, hp->h_name, sizeof(hnamebuf) - 1);
 		hnamebuf[sizeof(hnamebuf) - 1] = '\0';
 		hostname = hnamebuf;
-        printf("hostname is %s\n", hostname);
     }
 
-	memset(&msg, 0, sizeof(msg));
+	struct addrinfo* result;
+    struct addrinfo* res;
+	int error;
+
+	error = getaddrinfo(target, NULL, NULL, &result);
+	if(error != 0){
+        errx(EX_NOHOST, "cannot resolve %s: %s",target, hstrerror(h_errno));
+	}
+
+    for (res = result; res != NULL; res = res->ai_next) {
+        char _hostname[NI_MAXHOST];
+        error = getnameinfo(res->ai_addr, res->ai_addrlen, _hostname, NI_MAXHOST, NULL, 0, 0);
+        if (error != 0) {
+            fprintf(stderr, "error in getnameinfo: %s\n", gai_strerror(error));
+            continue;
+        }
+        if (*_hostname != '\0')
+            hostname = _hostname;
+    }
+
+    memset(&msg, 0, sizeof(msg));
 	msg.msg_name = (caddr_t)&from;
 	msg.msg_iov = &iov;
 	msg.msg_iovlen = 1;
@@ -394,6 +413,7 @@ pr_pack(char *buf, int cc, struct sockaddr_in *from, struct timeval *tv,
  *	Checksum routine for Internet Protocol family headers (C Version)
  */
 u_short in_cksum(u_short *addr, int len){
+
 	int nleft, sum;
 	u_short *w;
 	union {
