@@ -1,6 +1,6 @@
 # appleping
 
-Code derived from Apple's ping.c implementation.
+A barebones zero option ping implementation derived from Apple's official open source implementation..
 
 # running
 ```
